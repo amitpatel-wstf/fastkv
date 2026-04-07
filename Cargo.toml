@@ -1,0 +1,7 @@
+[package]
+name = "c_cli"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight Redis-like CLI tool in Rust"
+license = "MIT"
+
