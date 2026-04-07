@@ -20,9 +20,9 @@ A Redis-like in-memory key-value store and TCP server implemented in Rust. This 
 
 ### Building from Source
 
-1. Clone the repository:
+1. Clone the repository:    
    ```bash
-   git clone https://github.com/yourusername/fastkv.git
+   git clone https://github.com/amitpatel-wstf/fastkv.git
    cd fastkv
    ```
 
@@ -143,4 +143,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Repository
 
-[https://github.com/yourusername/fastkv](https://github.com/yourusername/fastkv)
+[https://github.com/amitpatel-wstf/fastkv.git](https://github.com/amitpatel-wstf/fastkv.git)
