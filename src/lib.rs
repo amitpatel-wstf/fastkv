@@ -1,14 +1,9 @@
-use lz4_flex::compress_prepend_size;
-use lz4_flex::decompress_size_prepended;
-use std::collections::HashMap;
+use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use hashbrown::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-// =========================
-// Error Handling
-// =========================
 
 #[derive(Debug)]
 pub enum CommandError {
@@ -17,24 +12,18 @@ pub enum CommandError {
     MissingArguments,
 }
 
-// =========================
-// Time Helper
-// =========================
-
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+pub enum Value {
+    Inline([u8; 32], usize),
+    Heap(Vec<u8>),
 }
 
-// =========================
-// Store (Core Engine)
-// =========================
+fn current_timestamp() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
 
 pub struct Store {
-    data: HashMap<Vec<u8>, Vec<u8>>,
-    expiry: HashMap<Vec<u8>, u64>,
+    pub data: HashMap<Vec<u8>, Value>,
+    pub expiry: HashMap<Vec<u8>, u64>,
 }
 
 impl Store {
@@ -45,8 +34,26 @@ impl Store {
         }
     }
 
+    fn store_value(data: Vec<u8>) -> Value {
+        if data.len() <= 32 {
+            let mut buf = [0u8; 32];
+            buf[..data.len()].copy_from_slice(&data);
+            Value::Inline(buf, data.len())
+        } else {
+            Value::Heap(data)
+        }
+    }
+
+    fn get_slice(value: &Value) -> &[u8] {
+        match value {
+            Value::Inline(buf, len) => &buf[..*len],
+            Value::Heap(vec) => vec.as_slice(),
+        }
+    }
+
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<u64>) {
-        self.data.insert(key.clone(), value);
+        let val = Self::store_value(value);
+        self.data.insert(key.clone(), val);
 
         if let Some(ttl_secs) = ttl {
             let expire_at = current_timestamp() + ttl_secs;
@@ -54,7 +61,7 @@ impl Store {
         }
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Option<&Vec<u8>> {
+    pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(&expire_at) = self.expiry.get(key) {
             if current_timestamp() > expire_at {
                 self.data.remove(key);
@@ -63,7 +70,7 @@ impl Store {
             }
         }
 
-        self.data.get(key)
+        self.data.get(key).map(|v| Self::get_slice(v).to_vec())
     }
 
     pub fn del(&mut self, key: &[u8]) {
@@ -75,16 +82,17 @@ impl Store {
         let mut buffer: Vec<u8> = Vec::new();
 
         for (key, value) in &self.data {
+            let val = Self::get_slice(value);
+
             let key_len = key.len() as u32;
-            let val_len = value.len() as u32;
+            let val_len = val.len() as u32;
 
             buffer.extend_from_slice(&key_len.to_le_bytes());
             buffer.extend_from_slice(key);
             buffer.extend_from_slice(&val_len.to_le_bytes());
-            buffer.extend_from_slice(value);
+            buffer.extend_from_slice(val);
         }
 
-        // 🔥 Compress entire buffer
         let compressed = compress_prepend_size(&buffer);
 
         let mut file = File::create(path).unwrap();
@@ -97,13 +105,15 @@ impl Store {
                 let mut i = 0;
 
                 while i < buffer.len() {
-                    let key_len = u32::from_le_bytes(buffer[i..i + 4].try_into().unwrap()) as usize;
+                    let key_len =
+                        u32::from_le_bytes(buffer[i..i + 4].try_into().unwrap()) as usize;
                     i += 4;
 
                     let key = buffer[i..i + key_len].to_vec();
                     i += key_len;
 
-                    let val_len = u32::from_le_bytes(buffer[i..i + 4].try_into().unwrap()) as usize;
+                    let val_len =
+                        u32::from_le_bytes(buffer[i..i + 4].try_into().unwrap()) as usize;
                     i += 4;
 
                     let value = buffer[i..i + val_len].to_vec();
@@ -134,13 +144,13 @@ impl Store {
     pub fn execute(&mut self, cmd: Command) -> String {
         match cmd {
             Command::Set(key, value, ttl) => {
-                let ttl = ttl.or(Some(86400)); // default 24h
+                let ttl = ttl.or(Some(86400));
                 self.set(key, value, ttl);
                 "OK".to_string()
             }
 
             Command::Get(key) => match self.get(&key) {
-                Some(val) => String::from_utf8_lossy(val).to_string(),
+                Some(val) => String::from_utf8_lossy(&val).to_string(),
                 None => "(nil)".to_string(),
             },
 
@@ -170,10 +180,6 @@ impl Store {
     }
 }
 
-// =========================
-// Command Enum
-// =========================
-
 pub enum Command {
     Set(Vec<u8>, Vec<u8>, Option<u64>),
     Get(Vec<u8>),
@@ -182,10 +188,6 @@ pub enum Command {
     Load(String),
     Exists(Vec<u8>),
 }
-
-// =========================
-// Command Parser
-// =========================
 
 pub fn parse_command(input: &str) -> Result<Command, CommandError> {
     let parts: Vec<&str> = input.trim().split_whitespace().collect();
@@ -202,10 +204,8 @@ pub fn parse_command(input: &str) -> Result<Command, CommandError> {
 
             let mut ttl: Option<u64> = None;
 
-            if parts.len() > 3 {
-                if parts[3] == "--expiry" && parts.len() > 4 {
-                    ttl = parts[4].parse::<u64>().ok();
-                }
+            if parts.len() > 4 && parts[3] == "--expiry" {
+                ttl = parts[4].parse::<u64>().ok();
             }
 
             Ok(Command::Set(

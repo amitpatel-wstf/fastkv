@@ -11,3 +11,4 @@ categories = ["database", "command-line-utilities"]
 
 [dependencies]
 lz4_flex = "0.11"
+threadpool = "1.8.1"
