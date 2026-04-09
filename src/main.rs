@@ -1,7 +1,7 @@
 use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -41,13 +41,12 @@ fn main() {
 
     let addr = format!("0.0.0.0:{}", port);
 
-    let store = Arc::new(RwLock::new(Store::new()));
+    // Initialize store with 64 shards for good concurrent performance
+    let store = Arc::new(Store::new(64));
 
     let store_clone = Arc::clone(&store);
     thread::spawn(move || loop {
-        if let Ok(mut store) = store_clone.write() {
-            store.cleanup_expired();
-        }
+        store_clone.cleanup_expired();
         thread::sleep(Duration::from_secs(5));
     });
 
@@ -69,9 +68,9 @@ fn main() {
     }
 }
 
-fn handle_client(stream: TcpStream, store: Arc<RwLock<Store>>) {
+fn handle_client(stream: TcpStream, store: Arc<Store>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut writer = stream;
+    let mut writer = BufWriter::new(stream);
 
     loop {
         let buffer = match reader.fill_buf() {
@@ -83,20 +82,26 @@ fn handle_client(stream: TcpStream, store: Arc<RwLock<Store>>) {
             break;
         }
 
-        let response = if buffer[0] == b'*' {
+        let is_resp = buffer[0] == b'*';
+
+        let res = if is_resp {
             match read_resp_command(&mut reader) {
-                Ok(Some(parts)) => handle_resp(parts, &store),
-                _ => "-ERR invalid request\r\n".to_string(),
+                Ok(Some(parts)) => handle_resp(parts, &store, &mut writer),
+                _ => writer.write_all(b"-ERR invalid request\r\n"),
             }
         } else {
             let mut line = String::new();
             if reader.read_line(&mut line).is_err() {
                 break;
             }
-            handle_plain(line, &store)
+            handle_plain(line, &store, &mut writer)
         };
 
-        if writer.write_all(response.as_bytes()).is_err() {
+        if res.is_err() {
+            break;
+        }
+
+        if writer.flush().is_err() {
             break;
         }
     }
@@ -129,92 +134,133 @@ fn read_resp_command(
     Ok(Some(parts))
 }
 
-fn handle_resp(parts: Vec<String>, store: &Arc<RwLock<Store>>) -> String {
+fn handle_resp<W: Write>(parts: Vec<String>, store: &Arc<Store>, writer: &mut W) -> std::io::Result<()> {
     if parts.is_empty() {
-        return "-ERR empty command\r\n".to_string();
+        return writer.write_all(b"-ERR empty command\r\n");
     }
 
     match parts[0].to_uppercase().as_str() {
         "SET" => {
             if parts.len() < 3 {
-                return "-ERR wrong args\r\n".to_string();
+                return writer.write_all(b"-ERR wrong args\r\n");
             }
             let key = parts[1].as_bytes().to_vec();
             let value = parts[2].as_bytes().to_vec();
-            let mut store = store.write().unwrap();
             store.set(key, value, Some(86400));
-            "+OK\r\n".to_string()
+            writer.write_all(b"+OK\r\n")
         }
         "GET" => {
             if parts.len() < 2 {
-                return "-ERR wrong args\r\n".to_string();
+                return writer.write_all(b"-ERR wrong args\r\n");
             }
             let key = parts[1].as_bytes();
-            let mut store = store.write().unwrap();
-            match store.get(key) {
-                Some(val) => {
-                    format!("${}\r\n{}\r\n", val.len(), String::from_utf8_lossy(val))
+            store.with_get(key, |val_opt| {
+                match val_opt {
+                    Some(val) => {
+                        writer.write_all(b"$")?;
+                        writer.write_all(val.len().to_string().as_bytes())?;
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(val)?;
+                        writer.write_all(b"\r\n")
+                    }
+                    None => writer.write_all(b"$-1\r\n"),
                 }
-                None => "$-1\r\n".to_string(),
-            }
+            })
         }
         "DEL" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"-ERR wrong args\r\n");
+            }
             let key = parts[1].as_bytes();
-            let mut store = store.write().unwrap();
             store.del(key);
-            ":1\r\n".to_string()
+            writer.write_all(b":1\r\n")
         }
         "EXISTS" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"-ERR wrong args\r\n");
+            }
             let key = parts[1].as_bytes();
-            let store = store.read().unwrap();
-            if store.data.contains_key(key) {
-                ":1\r\n".to_string()
+            if store.exists(key) {
+                writer.write_all(b":1\r\n")
             } else {
-                ":0\r\n".to_string()
+                writer.write_all(b":0\r\n")
             }
         }
-        _ => "-ERR unknown command\r\n".to_string(),
+        _ => writer.write_all(b"-ERR unknown command\r\n"),
     }
 }
 
-fn handle_plain(input: String, store: &Arc<RwLock<Store>>) -> String {
+fn handle_plain<W: Write>(input: String, store: &Arc<Store>, writer: &mut W) -> std::io::Result<()> {
     let parts: Vec<&str> = input.trim().split_whitespace().collect();
 
     if parts.is_empty() {
-        return "ERR\n".to_string();
+        return writer.write_all(b"ERR\n");
     }
 
     match parts[0].to_uppercase().as_str() {
         "SET" => {
+            if parts.len() < 3 {
+                return writer.write_all(b"ERR\n");
+            }
             let key = parts[1].as_bytes().to_vec();
             let value = parts[2].as_bytes().to_vec();
-            let mut store = store.write().unwrap();
-            store.set(key, value, Some(86400));
-            "OK\n".to_string()
+            
+            let mut ttl = Some(86400);
+            if parts.len() > 4 && parts[3] == "--expiry" {
+                ttl = parts[4].parse::<u64>().ok();
+            }
+            
+            store.set(key, value, ttl);
+            writer.write_all(b"OK\n")
         }
         "GET" => {
-            let key = parts[1].as_bytes();
-            let mut store = store.write().unwrap();
-            match store.get(key) {
-                Some(val) => format!("{}\n", String::from_utf8_lossy(val)),
-                None => "(nil)\n".to_string(),
+            if parts.len() < 2 {
+                return writer.write_all(b"ERR\n");
             }
+            let key = parts[1].as_bytes();
+            store.with_get(key, |val_opt| {
+                match val_opt {
+                    Some(val) => {
+                        writer.write_all(val)?;
+                        writer.write_all(b"\n")
+                    }
+                    None => writer.write_all(b"(nil)\n"),
+                }
+            })
         }
         "DEL" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"ERR\n");
+            }
             let key = parts[1].as_bytes();
-            let mut store = store.write().unwrap();
             store.del(key);
-            "OK\n".to_string()
+            writer.write_all(b"OK\n")
         }
         "EXISTS" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"ERR\n");
+            }
             let key = parts[1].as_bytes();
-            let store = store.read().unwrap();
-            if store.data.contains_key(key) {
-                "1\n".to_string()
+            if store.exists(key) {
+                writer.write_all(b"1\n")
             } else {
-                "0\n".to_string()
+                writer.write_all(b"0\n")
             }
         }
-        _ => "ERR\n".to_string(),
+        "SAVE" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"ERR\n");
+            }
+            store.save_binary(parts[1]);
+            writer.write_all(b"Saved\n")
+        }
+        "LOAD" => {
+            if parts.len() < 2 {
+                return writer.write_all(b"ERR\n");
+            }
+            store.load_binary(parts[1]);
+            writer.write_all(b"Loaded\n")
+        }
+        _ => writer.write_all(b"ERR\n"),
     }
 }

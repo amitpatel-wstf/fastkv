@@ -1,10 +1,10 @@
 [package]
 name = "fastkv"                 
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A Redis-like CLI and TCP server in Rust"
 license = "MIT"
-repository = "https://github.com/yourusername/rcli"
+repository = "https://github.com/amitpatel-wstf/fastkv"
 readme = "README.md"
 keywords = ["redis", "database", "cli", "key-value"]
 categories = ["database", "command-line-utilities"]
@@ -12,3 +12,5 @@ categories = ["database", "command-line-utilities"]
 [dependencies]
 lz4_flex = "0.11"
 threadpool = "1.8.1"
+ahash = "0.8"
+hashbrown = "0.14"
